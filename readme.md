@@ -1,23 +1,103 @@
-# rTMS-RAG: 重复经颅磁刺激知识图谱与Meta分析系统
+# TMS-GraphRAG
 
-基于 [nano-graphrag](https://github.com/gusye1234/nano-graphrag) 构建的多层连接研究知识图谱系统，专门用于 **重复经颅磁刺激（rTMS）** 领域的文献分析和Meta分析。
+**Knowledge Graph & Meta-Analysis System for rTMS (Repetitive Transcranial Magnetic Stimulation)**
 
-## 核心功能
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- **关键词增强的GraphRAG**：在传统图RAG基础上加入关键词索引和语义索引，实现更精准的跨论文知识检索
-- **多层次知识图谱**：支持从论文→实体→社区→全局的多层次查询
-- **Meta分析集成**：自动提取效应量、森林图、偏倚风险评估等
-- **多API支持**：兼容 OpenAI 协议的各种 LLM API（通义千问、DeepSeek、OpenAI等）
+A multi-layered knowledge graph system built on [nano-graphrag](https://github.com/gusye1234/nano-graphrag), designed for literature analysis and meta-analysis in the **rTMS** domain.
 
-## 快速开始
+---
 
-### 1. 安装依赖
+[中文](#中文) • [English](#english)
+
+---
+
+## English
+
+### Features
+
+- **Keyword-enhanced GraphRAG**: Augments traditional GraphRAG with keyword indexing and semantic indexing for more precise cross-paper knowledge retrieval
+- **Multi-layered Knowledge Graph**: Supports queries from paper → entity → community → global level
+- **Meta-Analysis Integration**: Automatic effect size extraction, forest plots, bias risk assessment, etc.
+- **Multi-API Support**: Compatible with any OpenAI-protocol LLM APIs (DeepSeek, Qwen, OpenAI, etc.)
+
+### Quick Start
+
+#### 1. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 配置 API 密钥
+#### 2. Configure API Keys
+
+Copy the environment template and fill in your credentials:
+
+```bash
+cp .env.example .env
+```
+
+Then edit the `.env` file with your API Key and endpoint.
+
+Or set environment variables directly:
+
+```bash
+export LLM_API_KEY=sk-xxx
+export LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/
+export LLM_MODEL=deepseek-v3
+```
+
+#### 3. Prepare Data
+
+Place your PDF/Markdown papers into `process/dataset/rTMS/markdown/` directory.
+
+#### 4. Run
+
+```bash
+python test.py
+```
+
+### Project Structure
+
+```
+├── nano_graphrag/                   # Core package
+│   ├── keyword_based_graphrag.py    # Keyword-enhanced GraphRAG (core)
+│   ├── meta_analysis_graphrag.py    # Meta-analysis GraphRAG
+│   ├── graphrag.py                  # Base GraphRAG implementation
+│   ├── base.py                      # Base class definitions
+│   ├── prompt.py                    # Prompt templates
+│   ├── _llm.py                      # LLM interfaces
+│   ├── _op.py                       # Operations layer
+│   ├── _utils.py                    # Utility functions
+│   ├── _storage/                    # Storage backends
+│   └── entity_extraction/           # Entity extraction module
+├── test.py                          # Main entry script
+├── meta_analysis.py                 # Meta-analysis logic
+├── outcome_aliases_config.py        # Outcome alias configuration
+├── .env.example                     # Environment variable template
+└── requirements.txt                 # Dependencies
+```
+
+---
+
+## 中文
+
+### 核心功能
+
+- **关键词增强的GraphRAG**：在传统图RAG基础上加入关键词索引和语义索引，实现更精准的跨论文知识检索
+- **多层次知识图谱**：支持从论文→实体→社区→全局的多层次查询
+- **Meta分析集成**：自动提取效应量、森林图、偏倚风险评估等
+- **多API支持**：兼容 OpenAI 协议的各种 LLM API（DeepSeek、通义千问、OpenAI等）
+
+### 快速开始
+
+#### 1. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+#### 2. 配置 API 密钥
 
 复制环境变量模板并填入你的密钥：
 
@@ -35,17 +115,17 @@ export LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/
 export LLM_MODEL=deepseek-v3
 ```
 
-### 3. 准备数据
+#### 3. 准备数据
 
 将你的 PDF/Markdown 论文放入 `process/dataset/rTMS/markdown/` 目录。
 
-### 4. 运行
+#### 4. 运行
 
 ```bash
 python test.py
 ```
 
-## 项目结构
+### 项目结构
 
 ```
 ├── nano_graphrag/                   # 核心包
@@ -66,9 +146,11 @@ python test.py
 └── requirements.txt                 # 依赖列表
 ```
 
-## 许可证
+---
+
+## License
 
 MIT License
 
-- 本项目的 GraphRAG 核心基于 [nano-graphrag](https://github.com/gusye1234/nano-graphrag) (MIT License, Copyright (c) 2024 Gustavo Ye) 重构
-- 关键词增强、Meta分析集成等功能为独立新增
+- The GraphRAG core is adapted from [nano-graphrag](https://github.com/gusye1234/nano-graphrag) (MIT License, Copyright (c) 2024 Gustavo Ye)
+- Keyword enhancement, meta-analysis integration, and other features are independently developed
