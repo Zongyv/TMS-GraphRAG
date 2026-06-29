@@ -2,10 +2,10 @@ import re
 import json
 import asyncio
 import tiktoken
-from typing import Union
+from typing import Union, List, Any
 from collections import Counter, defaultdict
-from ._splitter import SeparatorSplitter
-from ._utils import (
+from nano_graphrag._splitter import SeparatorSplitter
+from nano_graphrag._utils import (
     logger,
     clean_str,
     compute_mdhash_id,
@@ -17,7 +17,7 @@ from ._utils import (
     split_string_by_multi_markers,
     truncate_list_by_token_size,
 )
-from .base import (
+from nano_graphrag.base import (
     BaseGraphStorage,
     BaseKVStorage,
     BaseVectorStorage,
@@ -26,8 +26,9 @@ from .base import (
     TextChunkSchema,
     QueryParam,
 )
-from .prompt import GRAPH_FIELD_SEP, PROMPTS
-
+from nano_graphrag.prompt import GRAPH_FIELD_SEP, PROMPTS
+import requests
+import os
 
 def chunking_by_token_size(
     tokens_list: list[list[int]],
@@ -98,6 +99,564 @@ def chunking_by_seperators(
     return results
 
 
+
+def search_crossref_by_title(title, max_results=5):
+    url = "https://api.crossref.org/works"
+    params = {
+        "query.bibliographic": title,
+        "rows": max_results
+    }
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        items = response.json().get("message", {}).get("items", [])
+        results = []
+        for item in items:
+            results.append({
+                "title": item.get("title", [""])[0],
+                "DOI": item.get("DOI", ""),
+                "URL": item.get("URL", ""),
+                "author": ", ".join([f"{a.get('given', '')} {a.get('family', '')}" for a in item.get("author", [])]),
+                "published": item.get("published-print", {}).get("date-parts", [[None]])[0][0]
+            })
+        return results
+    else:
+        print(f"请求失败，状态码：{response.status_code}")
+        return []
+
+
+def remove_special_characters(text: str) -> str:
+    # 保留中文、英文、数字，空格，其余全部移除
+    return re.sub(r"[^\u4e00-\u9fff\sA-Za-z0-9\u3000]", "", text)
+
+def remove_markdown_images(text):
+    # 匹配 ![任何文字](任何链接)
+    return re.sub(r'!\[.*?\]\(.*?\)', '', text)
+
+def remove_all_whitespace(text: str) -> str:
+    # 移除所有空白字符
+    return re.sub(r"\s+|\u3000", "", text)
+
+def chunking_by_markdown_with_filter(
+    tokens_list: list[list[int]],
+    doc_keys: list[Any],
+    tiktoken_model,
+    del_headers: list[str] = [
+        "References", 
+        "Acknowledgments", 
+        "Appendix",
+        "AUTHOR CONTRIBUTIONS",
+        "FUNDING",
+        "ARTICLE INFORMATION",
+        "Supplementary Material",
+        "Supplementary Tables",
+        "Supplementary Figures",
+        "Supplementary Data",
+        "Supplementary Information",
+        "Supplementary Material",
+        "Supplementary Tables",
+        "Supplementary Figures",
+        "Potential Conflicts of Interest"
+        ],  # 移除的标题列表
+    overlap_token_size: int = 128,
+    max_token_size: int = 1024,
+    absolute_max_token_size: int = 1200,  # 添加绝对最大token限制
+):
+    """
+    按 Markdown 标题结构分块，并只保留以特定标题开头的块。
+    确保每个chunk不超过absolute_max_token_size。
+    """
+    results = []
+
+    header_pattern = re.compile(r'(#{1,6}\s+[^\n]+)')  # 匹配 Markdown 标题
+
+    for idx, tokens in enumerate(tokens_list):
+        full_text = tiktoken_model.decode(tokens)
+        full_text = remove_markdown_images(full_text)
+        parts = header_pattern.split(full_text)
+
+        segments = []
+        headers = []
+        for i in range(1, len(parts), 2):
+            header = parts[i]
+            header_without_special_characters = remove_special_characters(header).strip()
+            body = parts[i + 1] if i + 1 < len(parts) else ""
+            segment_text = header + body
+            if not any(remove_all_whitespace(header_without_special_characters).upper().startswith(remove_all_whitespace(h).upper()) for h in del_headers):
+                segments.append(segment_text)
+                headers.append(header_without_special_characters)
+            if remove_all_whitespace(header_without_special_characters).upper().startswith("REFERENCES".upper()):
+                break
+        if not segments:
+            continue  # 没有符合的段落，跳过此文档
+
+        # 寻找文章标题
+        for header in headers[:3]:
+            if len(header) > 20:
+                title = search_crossref_by_title(header)
+                for t in title:
+                    if t["title"].startswith(header):
+                        segments[0] = "[[article]]" + t["title"] + "[[/article]]\n" + segments[0]
+                        break
+
+        # 将每个段落编码为token
+        seg_tokens = [tiktoken_model.encode(seg) for seg in segments]
+        
+        # 处理超长段落，将其分割成更小的部分
+        processed_seg_tokens = []
+        for seg in seg_tokens:
+            if len(seg) > absolute_max_token_size:
+                # 如果单个段落超过最大限制，将其分割成多个小段落
+                for start in range(0, len(seg), absolute_max_token_size - overlap_token_size):
+                    end = min(start + absolute_max_token_size, len(seg))
+                    processed_seg_tokens.append(seg[start:end])
+            else:
+                processed_seg_tokens.append(seg)
+        
+        # 按 token 数组进行重组并考虑 overlap
+        chunks: List[List[int]] = []
+        current_chunk: List[int] = []
+        for seg in processed_seg_tokens:
+            # 检查添加当前段落是否会超过最大限制
+            if len(current_chunk) + len(seg) <= max_token_size:
+                current_chunk.extend(seg)
+            else:
+                # 如果当前chunk已经有内容，保存它
+                if current_chunk:
+                    chunks.append(current_chunk)
+                    # 保留overlap部分
+                    overlap_tokens = current_chunk[-overlap_token_size:] if len(current_chunk) > overlap_token_size else current_chunk
+                else:
+                    overlap_tokens = []
+                
+                # 检查段落本身是否超过最大限制
+                if len(seg) > absolute_max_token_size - len(overlap_tokens):
+                    # 如果段落太长，只取能放入的部分
+                    current_chunk = overlap_tokens + seg[:absolute_max_token_size - len(overlap_tokens)]
+                    chunks.append(current_chunk)
+                    
+                    # 处理剩余部分
+                    remaining = seg[absolute_max_token_size - len(overlap_tokens):]
+                    while remaining:
+                        current_chunk = remaining[:absolute_max_token_size]
+                        if len(current_chunk) == absolute_max_token_size:
+                            chunks.append(current_chunk)
+                            remaining = remaining[absolute_max_token_size - overlap_token_size:]
+                        else:
+                            current_chunk = remaining
+                            remaining = []
+                else:
+                    current_chunk = overlap_tokens + seg
+        
+        # 添加最后一个chunk
+        if current_chunk and len(current_chunk) <= absolute_max_token_size:
+            chunks.append(current_chunk)
+        elif current_chunk:
+            # 如果最后一个chunk太长，分割它
+            for start in range(0, len(current_chunk), absolute_max_token_size - overlap_token_size):
+                end = min(start + absolute_max_token_size, len(current_chunk))
+                chunks.append(current_chunk[start:end])
+
+        # 输出 chunk 结果
+        lengths = [len(chunk) for chunk in chunks]
+        texts = tiktoken_model.decode_batch(chunks)
+        for i, text in enumerate(texts):
+            results.append({
+                "tokens": lengths[i],
+                "content": text.strip(),
+                "chunk_order_index": i,
+                "full_doc_id": doc_keys[idx],
+            })
+
+    return results
+
+
+def chunking_by_markdown_with_table_preservation(
+    tokens_list: list[list[int]],
+    doc_keys: list[Any],
+    tiktoken_model,
+    del_headers: list[str] = [
+        "References",
+        "Appendix",
+        "AUTHOR CONTRIBUTIONS",
+        "ARTICLE INFORMATION",
+        "Supplementary Material",
+        "Supplementary Tables",
+        "Supplementary Figures",
+        "Supplementary Data",
+        "Supplementary Information",
+        "Potential Conflicts of Interest"
+    ],
+    overlap_token_size: int = 128,
+    max_token_size: int = 1024,
+    absolute_max_token_size: int = 1200,
+):
+    """
+    结合表格保护和Markdown过滤的分块方法。
+    表格保持完整，非表格部分按Markdown标题结构分块并过滤不需要的章节。
+    """
+    results = []
+
+    for idx, tokens in enumerate(tokens_list):
+        full_text = tiktoken_model.decode(tokens)
+        full_text = remove_markdown_images(full_text)
+        
+        # 识别表格边界
+        table_boundaries = _find_table_boundaries(full_text)
+        
+        # 根据表格边界分割文本
+        text_segments = _split_text_by_tables(full_text, table_boundaries)
+        
+        chunk_order_index = 0
+        
+        for segment in text_segments:
+            if segment['type'] == 'table':
+                # 表格直接作为一个chunk
+                table_tokens = tiktoken_model.encode(segment['content'])
+                if len(table_tokens) > max_token_size:
+                    print(f"警告: 表格超过token限制 ({len(table_tokens)} > {max_token_size})，但保持完整")
+                
+                results.append({
+                    "tokens": len(table_tokens),
+                    "content": segment['content'].strip(),
+                    "chunk_order_index": chunk_order_index,
+                    "full_doc_id": doc_keys[idx],
+                    "contains_table": True
+                })
+                chunk_order_index += 1
+                
+            else:  # 非表格文本
+                # 使用chunking_by_markdown_with_filter的逻辑
+                filtered_chunks = _process_non_table_text_with_filter(
+                    segment['content'],
+                    del_headers,
+                    tiktoken_model,
+                    max_token_size,
+                    overlap_token_size,
+                    absolute_max_token_size
+                )
+                
+                for chunk_content in filtered_chunks:
+                    chunk_tokens = tiktoken_model.encode(chunk_content)
+                    results.append({
+                        "tokens": len(chunk_tokens),
+                        "content": chunk_content.strip(),
+                        "chunk_order_index": chunk_order_index,
+                        "full_doc_id": doc_keys[idx],
+                        "contains_table": False
+                    })
+                    chunk_order_index += 1
+
+    return results
+
+
+def _split_text_by_tables(text: str, table_boundaries: list[tuple[int, int]]) -> list[dict]:
+    """
+    根据表格边界分割文本，返回文本段和表格段
+    """
+    segments = []
+    current_pos = 0
+    
+    for table_start, table_end in table_boundaries:
+        # 添加表格前的文本段
+        if current_pos < table_start:
+            text_content = text[current_pos:table_start].strip()
+            if text_content:
+                segments.append({
+                    'type': 'text',
+                    'content': text_content
+                })
+        
+        # 添加表格段
+        table_content = text[table_start:table_end].strip()
+        if table_content:
+            segments.append({
+                'type': 'table',
+                'content': table_content
+            })
+        
+        current_pos = table_end
+    
+    # 添加最后一个表格后的文本
+    if current_pos < len(text):
+        remaining_text = text[current_pos:].strip()
+        if remaining_text:
+            segments.append({
+                'type': 'text',
+                'content': remaining_text
+            })
+    
+    return segments
+
+def _process_non_table_text_with_filter(
+    text: str,
+    del_headers: list[str],
+    tiktoken_model,
+    max_token_size: int,
+    overlap_token_size: int,
+    absolute_max_token_size: int
+) -> list[str]:
+    """
+    对非表格文本使用chunking_by_markdown_with_filter的逻辑
+    """
+    header_pattern = re.compile(r'(#{1,6}\s+[^\n]+)')
+    parts = header_pattern.split(text)
+    
+    segments = []
+    headers = []
+    
+    # 处理第一个部分（可能没有标题的文本）
+    if len(parts) > 0 and parts[0].strip():
+        segments.append(parts[0].strip())
+        headers.append("")  # 无标题
+    
+    # 处理有标题的部分
+    for i in range(1, len(parts), 2):
+        header = parts[i]
+        header_without_special_characters = remove_special_characters(header).strip()
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        segment_text = header + body
+        
+        # 过滤不需要的章节
+        if not any(remove_all_whitespace(header_without_special_characters).upper().startswith(remove_all_whitespace(h).upper()) for h in del_headers):
+            segments.append(segment_text)
+            headers.append(header_without_special_characters)
+        
+        # 遇到References就停止
+        if remove_all_whitespace(header_without_special_characters).upper().startswith("REFERENCES".upper()):
+            break
+    
+    if not segments:
+        return []
+    
+    # 寻找文章标题并添加到第一个segment（只对有标题的segment）
+    for i, header in enumerate(headers[:3]):
+        if header and len(header) > 20:
+            title = search_crossref_by_title(header)
+            for t in title:
+                if t["title"].startswith(header):
+                    segments[i] = "[[article]]" + t["title"] + "[[/article]]\n" + segments[i]
+                    break
+            break
+    
+    # 将segments编码为tokens并进行分块
+    seg_tokens = [tiktoken_model.encode(seg) for seg in segments]
+    
+    # 处理超长段落
+    processed_seg_tokens = []
+    for seg in seg_tokens:
+        if len(seg) > absolute_max_token_size:
+            for start in range(0, len(seg), absolute_max_token_size - overlap_token_size):
+                end = min(start + absolute_max_token_size, len(seg))
+                processed_seg_tokens.append(seg[start:end])
+        else:
+            processed_seg_tokens.append(seg)
+    
+    # 重组chunks
+    chunks: List[List[int]] = []
+    current_chunk: List[int] = []
+    
+    for seg in processed_seg_tokens:
+        if len(current_chunk) + len(seg) <= max_token_size:
+            current_chunk.extend(seg)
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+                overlap_tokens = current_chunk[-overlap_token_size:] if len(current_chunk) > overlap_token_size else current_chunk
+            else:
+                overlap_tokens = []
+            
+            if len(seg) > absolute_max_token_size - len(overlap_tokens):
+                current_chunk = overlap_tokens + seg[:absolute_max_token_size - len(overlap_tokens)]
+                chunks.append(current_chunk)
+                
+                remaining = seg[absolute_max_token_size - len(overlap_tokens):]
+                while remaining:
+                    current_chunk = remaining[:absolute_max_token_size]
+                    if len(current_chunk) == absolute_max_token_size:
+                        chunks.append(current_chunk)
+                        remaining = remaining[absolute_max_token_size - overlap_token_size:]
+                    else:
+                        current_chunk = remaining
+                        remaining = []
+            else:
+                current_chunk = overlap_tokens + seg
+    
+    # 添加最后一个chunk
+    if current_chunk and len(current_chunk) <= absolute_max_token_size:
+        chunks.append(current_chunk)
+    elif current_chunk:
+        for start in range(0, len(current_chunk), absolute_max_token_size - overlap_token_size):
+            end = min(start + absolute_max_token_size, len(current_chunk))
+            chunks.append(current_chunk[start:end])
+    
+    # 解码为文本
+    return tiktoken_model.decode_batch(chunks)
+
+
+def _find_table_boundaries(text: str) -> list[tuple[int, int]]:
+    """
+    找到文本中所有表格的边界位置
+    返回: [(start_pos, end_pos), ...]
+    """
+    import re
+
+    table_boundaries = []
+
+    # 匹配Markdown表格模式
+    # 表格通常以 |---|---| 这样的分隔行标识
+    table_pattern = re.compile(
+        r'(\|[^\n]*\|[\s]*\n\|[\s]*[-:]+[\s]*\|[^\n]*\n(?:\|[^\n]*\|[\s]*\n)*)',
+        re.MULTILINE
+    )
+
+    for match in table_pattern.finditer(text):
+        start_pos = match.start()
+        end_pos = match.end()
+
+        # 扩展到完整的表格（包括表格前后的标题和说明）
+        extended_start, extended_end = _extend_table_boundaries(text, start_pos, end_pos)
+        table_boundaries.append((extended_start, extended_end))
+
+    # 合并重叠的表格边界
+    return _merge_overlapping_boundaries(table_boundaries)
+
+
+def _extend_table_boundaries(text: str, start: int, end: int) -> tuple[int, int]:
+    """
+    扩展表格边界，包含表格标题和说明
+    """
+    lines = text.split('\n')
+
+    # 找到表格开始和结束的行号
+    start_line = text[:start].count('\n')
+    end_line = text[:end].count('\n')
+
+    # 向前查找表格标题（通常在表格前1-2行）
+    extended_start_line = start_line
+    for i in range(max(0, start_line - 3), start_line):
+        line = lines[i].strip()
+        if line and (line.startswith('#') or 'table' in line.lower() or '表' in line):
+            extended_start_line = i
+            break
+
+    # 向后查找表格说明（通常在表格后1-2行）
+    extended_end_line = end_line
+    for i in range(end_line, min(len(lines), end_line + 3)):
+        line = lines[i].strip()
+        if line and (line.startswith('Note:') or line.startswith('注:') or 'caption' in line.lower()):
+            extended_end_line = i + 1
+        elif not line:  # 空行表示表格结束
+            break
+
+    # 转换回字符位置
+    extended_start = sum(len(lines[i]) + 1 for i in range(extended_start_line))
+    extended_end = sum(len(lines[i]) + 1 for i in range(extended_end_line))
+
+    return extended_start, min(extended_end, len(text))
+
+
+def _merge_overlapping_boundaries(boundaries: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """
+    合并重叠的边界
+    """
+    if not boundaries:
+        return []
+
+    sorted_boundaries = sorted(boundaries)
+    merged = [sorted_boundaries[0]]
+
+    for start, end in sorted_boundaries[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:  # 重叠
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+
+def _split_text_preserving_tables(
+        text: str,
+        table_boundaries: list[tuple[int, int]],
+        tiktoken_model,
+        max_token_size: int,
+        overlap_token_size: int
+) -> list[str]:
+    """
+    分割文本，保持表格完整
+    """
+    chunks = []
+    current_pos = 0
+
+    for table_start, table_end in table_boundaries:
+        # 处理表格前的文本
+        if current_pos < table_start:
+            pre_table_text = text[current_pos:table_start].strip()
+            if pre_table_text:
+                # 对非表格文本进行常规分块
+                pre_chunks = _chunk_regular_text(
+                    pre_table_text,
+                    tiktoken_model,
+                    max_token_size,
+                    overlap_token_size
+                )
+                chunks.extend(pre_chunks)
+
+        # 处理表格（作为单独的chunk，无视token限制）
+        table_text = text[table_start:table_end].strip()
+        if table_text:
+            table_tokens = len(tiktoken_model.encode(table_text))
+            if table_tokens > max_token_size:
+                print(f"警告: 表格超过token限制 ({table_tokens} > {max_token_size})，但保持完整")
+            chunks.append(table_text)
+
+        current_pos = table_end
+
+    # 处理最后一个表格后的文本
+    if current_pos < len(text):
+        remaining_text = text[current_pos:].strip()
+        if remaining_text:
+            remaining_chunks = _chunk_regular_text(
+                remaining_text,
+                tiktoken_model,
+                max_token_size,
+                overlap_token_size
+            )
+            chunks.extend(remaining_chunks)
+
+    return chunks
+
+
+def _chunk_regular_text(
+        text: str,
+        tiktoken_model,
+        max_token_size: int,
+        overlap_token_size: int
+) -> list[str]:
+    """
+    对常规文本进行分块
+    """
+    tokens = tiktoken_model.encode(text)
+    chunks = []
+
+    for start in range(0, len(tokens), max_token_size - overlap_token_size):
+        chunk_tokens = tokens[start:start + max_token_size]
+        chunk_text = tiktoken_model.decode(chunk_tokens)
+        chunks.append(chunk_text)
+
+    return chunks
+
+
+def _contains_table(text: str) -> bool:
+    """
+    检查文本是否包含表格
+    """
+    import re
+    table_pattern = re.compile(r'\|[^\n]*\|[\s]*\n\|[\s]*[-:]+[\s]*\|')
+    return bool(table_pattern.search(text))
+
+
+
 def get_chunks(new_docs, chunk_func=chunking_by_token_size, **chunk_func_params):
     inserting_chunks = {}
 
@@ -114,6 +673,54 @@ def get_chunks(new_docs, chunk_func=chunking_by_token_size, **chunk_func_params)
     for chunk in chunks:
         inserting_chunks.update(
             {compute_mdhash_id(chunk["content"], prefix="chunk-"): chunk}
+        )
+
+    return inserting_chunks
+
+
+def get_meta_chunks(new_docs, chunk_func=chunking_by_token_size, **chunk_func_params):
+    inserting_chunks = {}
+
+    new_docs_list = list(new_docs.items())
+    docs = [new_doc[1]["content"] for new_doc in new_docs_list]
+    doc_keys = [new_doc[0] for new_doc in new_docs_list]  # 这里就是DOI
+
+    ENCODER = tiktoken.encoding_for_model("gpt-4o")
+    tokens = ENCODER.encode_batch(docs, num_threads=16)
+    chunks = chunk_func(
+        tokens, doc_keys=doc_keys, tiktoken_model=ENCODER, **chunk_func_params
+    )
+
+    for chunk in chunks:
+        # 计算chunk在原文中的字符位置
+        original_content = new_docs[chunk["full_doc_id"]]["content"]
+        chunk_content = chunk["content"]
+
+        # 查找chunk在原文中的起始位置
+        start_position = original_content.find(chunk_content.strip())
+        if start_position == -1:
+            # 如果找不到精确匹配，尝试查找部分匹配
+            chunk_words = chunk_content.strip().split()[:10]  # 取前10个词
+            search_text = " ".join(chunk_words)
+            start_position = original_content.find(search_text)
+
+        end_position = start_position + len(chunk_content) if start_position != -1 else -1
+
+        # 添加DOI和位置信息到chunk
+        enhanced_chunk = {
+            **chunk,
+            "paper_doi": chunk["full_doc_id"],  # DOI信息
+            "start_position": start_position,  # 在原文中的起始字符位置
+            "end_position": end_position,  # 在原文中的结束字符位置
+            "position_info": {
+                "char_start": start_position,
+                "char_end": end_position,
+                "chunk_length": len(chunk_content)
+            }
+        }
+
+        inserting_chunks.update(
+            {compute_mdhash_id(chunk["content"], prefix="chunk-"): enhanced_chunk}
         )
 
     return inserting_chunks
@@ -323,6 +930,16 @@ async def extract_entities(
         final_result = await use_llm_func(hint_prompt)
         if isinstance(final_result, list):
             final_result = final_result[0]["text"]
+
+        chunk_record = {
+            "chunk_key": chunk_key,
+            "prompt": content,
+            "response": final_result
+        }
+        record_dir = global_config["working_dir"]
+        record_file = os.path.join(record_dir, f"chunk_record.json")
+        with open(record_file, "a", encoding="utf-8") as f:
+            json.dump(chunk_record, f, ensure_ascii=False, indent=2)
 
         history = pack_user_ass_to_openai_messages(hint_prompt, final_result, using_amazon_bedrock)
         for now_glean_index in range(entity_extract_max_gleaning):

@@ -20,6 +20,7 @@ from ._llm import (
 )
 from ._op import (
     chunking_by_token_size,
+    chunking_by_markdown_with_filter,
     extract_entities,
     generate_community_report,
     get_chunks,
@@ -68,7 +69,7 @@ class GraphRAG:
             Optional[int],
         ],
         List[Dict[str, Union[str, int]]],
-    ] = chunking_by_token_size
+    ] = chunking_by_markdown_with_filter
     chunk_token_size: int = 1200
     chunk_overlap_token_size: int = 100
     tiktoken_model_name: str = "gpt-4o"
@@ -89,7 +90,6 @@ class GraphRAG:
             "dimensions": 1536,
             "num_walks": 10,
             "walk_length": 40,
-            "num_walks": 10,
             "window_size": 2,
             "iterations": 3,
             "random_seed": 3,
@@ -114,10 +114,10 @@ class GraphRAG:
     cheap_model_id: str = "us.anthropic.claude-3-haiku-20240307-v1:0"
     best_model_func: callable = gpt_4o_complete
     best_model_max_token_size: int = 32768
-    best_model_max_async: int = 16
+    best_model_max_async: int = 12
     cheap_model_func: callable = gpt_4o_mini_complete
     cheap_model_max_token_size: int = 32768
-    cheap_model_max_async: int = 16
+    cheap_model_max_async: int = 12  
 
     # entity extraction
     entity_extraction_func: callable = extract_entities
